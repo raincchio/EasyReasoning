@@ -2,11 +2,10 @@
 # coding: utf-8
 
 # In[18]:
-
+import tyro
 
 from dataclasses import dataclass
 from typing import Tuple, Any, Dict, Sequence
-import math
 import torch
 from torch import nn
 import torch.nn.functional as F
@@ -16,10 +15,6 @@ from einops import rearrange
 from datasets import load_dataset
 from torch.utils.data import DataLoader
 import random
-
-import copy
-
-from tqdm import trange
 
 torch._dynamo.config.compiled_autograd = True
 torch.set_float32_matmul_precision('high')
@@ -347,9 +342,9 @@ class HRM(nn.Module):
                     z_L = self.L_level(z_L, z_H + x, **seq_info)
                 z_H = self.H_level(z_H, z_L, **seq_info)
 
-        for _j in range(self.L_cycles):
-            z_L = self.L_level(z_L, z_H+x, **seq_info)
-
+            for _j in range(self.L_cycles-1):
+                z_L = self.L_level(z_L, z_H+x, **seq_info)
+        z_L = self.L_level(z_L, z_H + x, **seq_info)
         z_H = self.H_level(z_H, z_L , **seq_info)
 
         self.carry_h = torch.cat((z_H, self.carry_h[input_ids.shape[0]:]), dim=0).detach()
@@ -457,8 +452,9 @@ def create_dataloader(split: str, batch_size: int):
 # In[ ]:
 
 
-# traing model
-model_config, train_config = HRMConfig(), TrainConfig()
+
+model_config  = tyro.cli(HRMConfig)
+train_config = TrainConfig()
 set_up(model_config.seed)
 device = torch.accelerator.current_accelerator(check_available=True)
 if device is None:
@@ -492,8 +488,10 @@ eval_loaders = {split_name: create_dataloader(split_name, model_config.batch_siz
 import datetime, os
 timestamp = datetime.datetime.now().strftime('%Y%m%d%H%M%S')
 current_file_name = os.path.basename(__file__)
-log_file= open(f'{timestamp}_{current_file_name[:-3]}_log.txt', 'w')
-
+log_file= open(f'hrm-width-{model_config.hidden_size}_depth-{model_config.num_layers}.txt', 'w')
+print(model_config)
+log_file.write(str(model_config))
+log_file.flush()
 
 for epoch in range(1, train_config.epochs+1):
     model.train()

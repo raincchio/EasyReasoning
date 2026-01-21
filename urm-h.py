@@ -1,12 +1,6 @@
-#!/usr/bin/env python
-# coding: utf-8
-
-# In[18]:
-
-
 from dataclasses import dataclass
 from typing import Tuple, Any, Dict, Sequence
-import math
+
 import torch
 from torch import nn
 import torch.nn.functional as F
@@ -17,9 +11,6 @@ from datasets import load_dataset
 from torch.utils.data import DataLoader
 import random
 
-import copy
-
-from tqdm import trange
 
 torch._dynamo.config.compiled_autograd = True
 torch.set_float32_matmul_precision('high')
@@ -435,10 +426,10 @@ def collate_fn(batch: Dict[str, Any]) -> Tuple[torch.Tensor, torch.Tensor]:
 def create_dataloader(split: str, batch_size: int):
 
     data_files = {
-        'train':'data/train.csv',
-        'test_hard':'data/test_hard.csv',
-        'test_sudoku_bench':'data/test_sudoku_bench.csv',
-        'train_aug': 'data/train_aug.csv',
+        'train':'data/sudoku/train.csv',
+        'test_hard':'data/sudoku/test_hard.csv',
+        'test_sudoku_bench':'data/sudoku/test_sudoku_bench.csv',
+        'train_aug': 'data/sudoku/train_aug.csv',
     }
     dataset = load_dataset('csv', data_files=data_files, split=split)
 
@@ -501,8 +492,8 @@ for epoch in range(1, train_config.epochs+1):
     for x, y in train_loader:
         x = x.to(device)
         y = y.long().to(device)
-        with torch.device(device):
-            model.init_carry()
+        # with torch.device(device):
+        #     model.init_carry()
 
         for cycle in range(train_config.cycle_per_data):
             metrics = train_step(model, opt, x, y)
@@ -529,8 +520,6 @@ for epoch in range(1, train_config.epochs+1):
         num_total = 0
         num_correct = 0
         for x, y in eval_loader:
-            with torch.device(device):
-                model.init_carry()
             for cycle in range(model_config.cycle_per_data):
                 y_hat = model(x.to(device))
             y_hat = torch.argmax(y_hat, dim=-1)
