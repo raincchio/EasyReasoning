@@ -1,6 +1,6 @@
 from datasets import load_dataset
 import numpy as np
-
+from tqdm import tqdm
 # augment method
 def shuffle_sudoku(board: np.ndarray, solution: np.ndarray):
     # Create a random digit mapping: a permutation of 1..9, with zero (blank) unchanged
@@ -37,48 +37,47 @@ def shuffle_sudoku(board: np.ndarray, solution: np.ndarray):
 # The data are sourced from https://huggingface.co/datasets/sapientinc/sudoku-extreme-1k
 data_files = {
     'train': './train.csv',
-    'test_hard': './test_hard.csv',
-    'test_sudoku_bench': './test_sudoku_bench.csv',
-    # 'train1': 'data/train1.csv',
-    # 'train2': 'data/train2.csv',
+    'test': './test.csv',
 }
 
 # augment the original dataset 160x
-dataset = load_dataset('csv', data_files=data_files,split='train').repeat(160)
+dataset = load_dataset('csv', data_files=data_files,split='test').repeat(1)
 
 # len_log = []
 from data.generator.util import generate_levels
 xs, ys = [], []
+puzzles = {}
 leave_blank = 1
 import random
 nums = random.choices(range(81), k=len(dataset))
-for idx,item in enumerate(dataset):
+for idx,item in enumerate(tqdm(dataset)):
     board = np.frombuffer(item["question"].replace('.', '0').encode(), dtype=np.uint8).reshape(9, 9) - ord('0')
     solution = np.frombuffer(item["answer"].encode(), dtype=np.uint8).reshape(9, 9) - ord('0')
 
     # transform puzzle
     # such as rotation and exchange columns or remapping the number
-    board, solution = shuffle_sudoku(board, solution)
+    # board, solution = shuffle_sudoku(board, solution)
 
     # len_log.append((board==0).sum())
     # Convert and flatten
     # board = (board + +ord('0')).flatten().astype(np.int8).tobytes().decode()
 
     solution = (solution.flatten().astype(np.int8) + ord('0')).tobytes().decode()
-    puzzles = generate_levels(solution)
-    puzzles['leave1'] = solution[nums[idx]]
+    # puzzles = generate_levels(solution)
+    # puzzles['leave1'] = solution[nums[idx]]
+    board = list(solution)
+    board[nums[idx]] = "0"
+    board = "".join(board)
     # Pad a BOS token
     xs.append(board)
     ys.append(solution)
 
 import pandas as pd
-levels = ['leave1', 'easy', 'medium', 'hard','expert']
 
-for level in levels:
 # 创建 DataFrame
-    data = {'question': xs, 'answer': ys[level]}
-    df = pd.DataFrame(data)
-    # len_log = np.array(len_log)
-    # print(len_log.mean())
+data = {'question': xs, 'answer': ys}
+df = pd.DataFrame(data)
+# len_log = np.array(len_log)
+# print(len_log.mean())
 
-    df.to_csv(f'./train_{level}.csv', index=False)
+df.to_csv(f'./test_leave1.csv', index=False)

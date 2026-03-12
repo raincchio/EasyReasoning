@@ -12,10 +12,9 @@ import torch.nn.functional as F
 import numpy as np
 from einops import rearrange
 
-from datasets import load_dataset
 from torch.utils.data import DataLoader
 import random
-import torch.nn.init as init
+
 # torch._dynamo.config.compiled_autograd = True
 torch.set_float32_matmul_precision('high')
 
@@ -29,20 +28,21 @@ class HRMConfig:
     seq_len: int = 81  # Sudoku has 9x9 = 81 cells + BOS
 
     hidden_size: int = 256
-    intermediate_size: int = 256
-    batch_size: int = 1024
+    # intermediate_size: int = 256
+    batch_size: int = 256
     head_dim: int = 64
     is_causal: bool = False
 
     num_layers: int = 4
 
-    H_cycles: int = 1
-    L_cycles: int = 1
+    H_cycles: int = 2
+    L_cycles: int = 4
 
     cycle_per_data: int = 16
 
     norm_eps: float = 1e-4
     rope_base: float = 10000.0
+    forward_dtype: str = "float32" # change to float32 if your hardware doesn't support bfloat16
 
     seed: int = 42
 
@@ -269,11 +269,68 @@ class TransformerBlock(nn.Module):
         x = self.norm(x + self.attn(x, **kwargs))
         return self.norm(x + self.mlp(x))
 
+# class MLPBlock(nn.Module):
+#     def __init__(self, config: HRMConfig) -> None:
+#         super().__init__()
+#         # hidden_size=512
+#         # self.seq = nn.Sequential(
+#         #     nn.Linear(config.hidden_size, config.hidden_size),
+#         #     nn.ReLU(),
+#         #     nn.LayerNorm(config.hidden_size),
+#         #     # nn.Linear(config.hidden_size, config.hidden_size),
+#         #     # nn.ReLU(),
+#         #     # nn.LayerNorm(config.hidden_size),
+#         # )
+#         self.relation = RelationNetwork(d_model=config.hidden_size, hidden=config.hidden_size)
+#         # for module in self.relation:
+#         #     if isinstance(module, nn.Linear):
+#         #         # 高斯初始化，均值0，方差小一些，比如 std=0.01
+#         #         init.normal_(module.weight, mean=0.0, std=0.01)
+#         #         if module.bias is not None:
+#         #             nn.init.constant_(module.bias, 0.0)
+#
+#
+#     def forward(self, x: torch.Tensor, **kwargs) -> torch.Tensor:  # Post Norm
+#         # x = self.seq(x)
+#         return self.relation(x)
+class MLPSeqBlock(nn.Module):
+    def __init__(self, config: HRMConfig, **kwargs) -> None:
+        super().__init__()
+
+        self.in_proj = CastedLinear(
+            in_features=config.hidden_size,
+            out_features=config.hidden_size,
+            bias=False,
+            **kwargs
+        )
+
+        self.rel_proj = CastedLinear(
+            in_features=config.seq_len,
+            out_features=config.seq_len,
+            bias=False,
+            **kwargs
+        )
+
+        self.out_proj = CastedLinear(
+            in_features=config.hidden_size,
+            out_features=config.hidden_size,
+            bias=False,
+            **kwargs
+        )
+
+        self.norm = lambda x: F.rms_norm(x, (x.shape[-1],), eps=config.norm_eps)
+        self.act = F.silu # activation function. U can try anything like ReLU, SiLU, ...
+
+    def forward(self, x:torch.Tensor, **kwargs):
+        in_proj = self.norm(self.act(self.in_proj(x)) + x).transpose(-1, -2)
+        rel_proj = self.norm(self.act(self.rel_proj(in_proj)) + in_proj).transpose(-1, -2)
+        return self.norm(self.act(self.out_proj(rel_proj)) + rel_proj)
+
 
 class HRMRecurrentBlock(nn.Module):
     def __init__(self, config: HRMConfig) -> None:
         super().__init__()
-        self.layers = nn.ModuleList([TransformerBlock(config) for _layer_idx in range(config.num_layers)])
+        self.layers = nn.ModuleList([MLPSeqBlock(config) for _layer_idx in range(config.num_layers)])
 
     def forward(self, x: torch.Tensor, n: torch.Tensor, **kwargs) -> torch.Tensor:
         h = x + n
@@ -281,6 +338,12 @@ class HRMRecurrentBlock(nn.Module):
             h = layer(h, **kwargs)
         return h
 
+# HRMCarry is a tuple containing two latent states(z_H, z_L)
+HRMCarry = Tuple[torch.Tensor, torch.Tensor]
+datatype ={
+    'float32':torch.float32,
+    'bfloat16':torch.bfloat16,
+}
 
 class HRM(nn.Module):
     def __init__(self, config: HRMConfig) -> None:
@@ -290,7 +353,7 @@ class HRM(nn.Module):
 
         self.hidden_size = config.hidden_size
         self.seq_len = config.seq_len
-        self.dtype =torch.float32
+        self.dtype =datatype[config.forward_dtype]
 
         self.batch_size = config.batch_size
 
@@ -341,16 +404,17 @@ class HRM(nn.Module):
             # compatible for inference
             z_H = self.carry_h[:input_ids.shape[0]]
             z_L = self.carry_l[:input_ids.shape[0]] # Unpack tuple
-            for _i in range(self.H_cycles - 1):
-                for _j in range(self.L_cycles):
-                    z_L = self.L_level(z_L, z_H + x, **seq_info)
-                z_H = self.H_level(z_H, z_L, **seq_info)
+        # for _i in range(self.H_cycles - 1):
+        #     for _j in range(self.L_cycles):
+        #         z_L = self.L_level(z_L, z_H + x, **seq_info)
+        #     z_H = self.H_level(z_H, z_L, **seq_info)
 
-            for _j in range(self.L_cycles-1):
-                z_L = self.L_level(z_L, z_H + x, **seq_info)
+        for _j in range(self.L_cycles-1):
+            z_L = self.L_level(z_L, z_H + x, **seq_info)
 
         z_L = self.L_level(z_L, z_H + x, **seq_info)
         z_H = self.H_level(z_H, z_L , **seq_info)
+        z_H = self.H_level(z_H, z_L, **seq_info)
 
         self.carry_h = torch.cat((z_H, self.carry_h[input_ids.shape[0]:]), dim=0).detach()
         self.carry_l = torch.cat((z_L, self.carry_l[input_ids.shape[0]:]), dim=0).detach()
@@ -385,7 +449,7 @@ def train_step(model: nn.Module, opt: torch.optim.Optimizer, x: torch.Tensor, y:
 # In[ ]:
 import os
 def train():
-    # dist.init_process_group("nccl")
+    dist.init_process_group("nccl")
     local_rank = int(os.environ["LOCAL_RANK"])
     # world_size = int(os.environ["WORLD_SIZE"])
     torch.cuda.set_device(local_rank)
@@ -396,23 +460,23 @@ def train():
 
     model = HRM(model_config).cuda(local_rank)
     model = torch.compile(model, dynamic=False, fullgraph=True)
-    # model = DDP(model, device_ids=[local_rank],static_graph=True)
+    model = DDP(model, device_ids=[local_rank],static_graph=True)
     #
 
     # from muon import SingleDeviceMuon
     from torch.optim import Adam
 
     opt = Adam(model.parameters(), lr=model_config.lr, weight_decay=model_config.weight_decay)
-    # from torch.utils.data.distributed import DistributedSampler
+    from torch.utils.data.distributed import DistributedSampler
     from util.data import SudokuDataset
     dataset = SudokuDataset('data/train_convert.csv')
-    # train_sampler = DistributedSampler(dataset,shuffle=True)
-    train_loader = DataLoader(dataset, batch_size=model_config.batch_size, shuffle=True, num_workers=4, pin_memory=True)
+    train_sampler = DistributedSampler(dataset,shuffle=True)
+    train_loader = DataLoader(dataset, batch_size=model_config.batch_size, sampler=train_sampler, num_workers=4, pin_memory=True)
     # train_loader = DataLoader(dataset, batch_size=model_config.batch_size)
 
     eval_dataset = SudokuDataset('data/test_convert.csv')
-    # eval_sampler = DistributedSampler(eval_dataset, shuffle=False)
-    eval_loader= DataLoader(eval_dataset, batch_size=model_config.batch_size, shuffle=True, num_workers=4, pin_memory=True)
+    eval_sampler = DistributedSampler(eval_dataset, shuffle=False)
+    eval_loader= DataLoader(eval_dataset, batch_size=model_config.batch_size, sampler=eval_sampler, num_workers=4, pin_memory=True)
 
 
     # Train & Eval loop
@@ -435,7 +499,7 @@ def train():
         step = 0
 
         len_train = train_loader.__len__()
-        model.restore_carry()
+        model.module.restore_carry()
         for x, y in train_loader:
             x = x.cuda(local_rank)
             y = y.cuda(local_rank)
@@ -448,7 +512,7 @@ def train():
                 #     break
             step += 1
             # scheduler.step()
-            model.restore_carry()
+            model.module.restore_carry()
             if local_rank==0 and step%25==0:
                 info = f"Ep {epoch}/{model_config.epochs} Step {step}/{len_train}: loss={loss:.6f} per_position_accuracy={per_pos_crt:.6f}, exact_match={crt:.6f}"
                 print (info)
@@ -469,9 +533,9 @@ def train():
                 y_hat = torch.argmax(y_hat, dim=-1)
                 total += y.shape[0]
                 correct += torch.all(y_hat == y.cuda(local_rank), dim=-1).sum().item()
-                model.restore_carry()
-        # dist.all_reduce(correct, op=dist.ReduceOp.SUM)
-        # dist.all_reduce(total, op=dist.ReduceOp.SUM)
+                model.module.restore_carry()
+        dist.all_reduce(correct, op=dist.ReduceOp.SUM)
+        dist.all_reduce(total, op=dist.ReduceOp.SUM)
         if local_rank==0:
             info =  f"[Eval Set test ]" + f"Solved: {100 * correct / total:.2f}% ({correct}/{total})"
             print(info)

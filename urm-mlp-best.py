@@ -20,16 +20,15 @@ import torch.nn.init as init
 torch.set_float32_matmul_precision('high')
 
 from util.encoding import SudokuEncoder, RelationNetwork
-from torch.nn.parallel import DistributedDataParallel as DDP
-import torch.distributed as dist
+
 # [Set hyperparams here]
 @dataclass
 class HRMConfig:
     vocab_size: int = 10  # Sudoku digits 0(unfilled) .. 9
     seq_len: int = 81  # Sudoku has 9x9 = 81 cells + BOS
 
-    hidden_size: int = 256
-    intermediate_size: int = 256
+    hidden_size: int = 22
+    # intermediate_size: int = 256
     batch_size: int = 1024
     head_dim: int = 64
     is_causal: bool = False
@@ -37,16 +36,17 @@ class HRMConfig:
     num_layers: int = 4
 
     H_cycles: int = 1
-    L_cycles: int = 1
+    L_cycles: int = 2
 
-    cycle_per_data: int = 16
+    cycle_per_data: int = 4
 
     norm_eps: float = 1e-4
     rope_base: float = 10000.0
+    forward_dtype: str = "float32" # change to float32 if your hardware doesn't support bfloat16
 
     seed: int = 42
 
-    epochs: int = 200
+    epochs: int = 5
 
     lr: float = 3e-5
     weight_decay: float = 0
@@ -77,6 +77,8 @@ def set_up(seed: int) -> None:
     torch.backends.cudnn.enabled = True
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
+
+
 # In[20]:
 
 
@@ -269,11 +271,81 @@ class TransformerBlock(nn.Module):
         x = self.norm(x + self.attn(x, **kwargs))
         return self.norm(x + self.mlp(x))
 
+# class MLPBlock(nn.Module):
+#     def __init__(self, config: HRMConfig) -> None:
+#         super().__init__()
+#         # hidden_size=512
+#         # self.seq = nn.Sequential(
+#         #     nn.Linear(config.hidden_size, config.hidden_size),
+#         #     nn.ReLU(),
+#         #     nn.LayerNorm(config.hidden_size),
+#         #     # nn.Linear(config.hidden_size, config.hidden_size),
+#         #     # nn.ReLU(),
+#         #     # nn.LayerNorm(config.hidden_size),
+#         # )
+#         self.relation = RelationNetwork(d_model=config.hidden_size, hidden=config.hidden_size)
+#         # for module in self.relation:
+#         #     if isinstance(module, nn.Linear):
+#         #         # 高斯初始化，均值0，方差小一些，比如 std=0.01
+#         #         init.normal_(module.weight, mean=0.0, std=0.01)
+#         #         if module.bias is not None:
+#         #             nn.init.constant_(module.bias, 0.0)
+#
+#
+#     def forward(self, x: torch.Tensor, **kwargs) -> torch.Tensor:  # Post Norm
+#         # x = self.seq(x)
+#         return self.relation(x)
+class MLPSeqBlock(nn.Module):
+    def __init__(self, config: HRMConfig, **kwargs) -> None:
+        super().__init__()
+
+        self.in_proj = CastedLinear(
+            in_features=config.hidden_size,
+            out_features=config.hidden_size,
+            bias=False,
+            **kwargs
+        )
+
+        self.rel_proj = CastedLinear(
+            in_features=config.seq_len,
+            out_features=config.seq_len,
+            bias=False,
+            **kwargs
+        )
+
+        self.out_proj = CastedLinear(
+            in_features=config.hidden_size,
+            out_features=config.hidden_size,
+            bias=False,
+            **kwargs
+        )
+
+        self.norm = lambda x: F.rms_norm(x, (x.shape[-1],), eps=config.norm_eps)
+        self.act = F.silu # activation function. U can try anything like ReLU, SiLU, ...
+
+    def forward(self, x:torch.Tensor, **kwargs):
+        in_proj = self.norm(self.act(self.in_proj(x)) + x).transpose(-1, -2)
+        rel_proj = self.norm(self.act(self.rel_proj(in_proj)) + in_proj).transpose(-1, -2)
+        return self.norm(self.act(self.out_proj(rel_proj)) + rel_proj)
+
+class GluBlock(nn.Module):
+    def __init__(self, config: HRMConfig) -> None:
+        super().__init__()
+
+        self.mlp = ConvSwiGLU(
+            hidden_size=config.hidden_size,
+            intermediate_size=config.intermediate_size
+        )
+        self.norm = lambda x: F.rms_norm(x, (x.shape[-1], ), eps=config.norm_eps)
+
+    def forward(self, x: torch.Tensor, **kwargs) -> torch.Tensor:  # Post Norm
+        # x = self.norm(x + self.attn(x, **kwargs))
+        return self.norm(x + self.mlp(x))
 
 class HRMRecurrentBlock(nn.Module):
     def __init__(self, config: HRMConfig) -> None:
         super().__init__()
-        self.layers = nn.ModuleList([TransformerBlock(config) for _layer_idx in range(config.num_layers)])
+        self.layers = nn.ModuleList([MLPSeqBlock(config) for _layer_idx in range(config.num_layers)])
 
     def forward(self, x: torch.Tensor, n: torch.Tensor, **kwargs) -> torch.Tensor:
         h = x + n
@@ -281,6 +353,12 @@ class HRMRecurrentBlock(nn.Module):
             h = layer(h, **kwargs)
         return h
 
+# HRMCarry is a tuple containing two latent states(z_H, z_L)
+HRMCarry = Tuple[torch.Tensor, torch.Tensor]
+datatype ={
+    'float32':torch.float32,
+    'bfloat16':torch.bfloat16,
+}
 
 class HRM(nn.Module):
     def __init__(self, config: HRMConfig) -> None:
@@ -290,7 +368,7 @@ class HRM(nn.Module):
 
         self.hidden_size = config.hidden_size
         self.seq_len = config.seq_len
-        self.dtype =torch.float32
+        self.dtype =datatype[config.forward_dtype]
 
         self.batch_size = config.batch_size
 
@@ -354,7 +432,7 @@ class HRM(nn.Module):
 
         self.carry_h = torch.cat((z_H, self.carry_h[input_ids.shape[0]:]), dim=0).detach()
         self.carry_l = torch.cat((z_L, self.carry_l[input_ids.shape[0]:]), dim=0).detach()
-        if self.H_cycles!=0:
+        if model_config.H_cycles!=0:
             return self.lm_head(z_H)  # Return tuple and ensure no gradient moves across carry
         else:
             return self.lm_head(z_L)
@@ -364,121 +442,196 @@ class HRM(nn.Module):
 
 
 # [Training and Inference Step]
-@torch.compile(dynamic=False)
+# @torch.compile(dynamic=False)
 def train_step(model: nn.Module, opt: torch.optim.Optimizer, x: torch.Tensor, y: torch.Tensor):
 
     y_hat = model(x)
     # loss (f32 for CrossEntropy)
     # params = {k: v.clone() for k, v in model.H_level.state_dict().items()}
-    opt.zero_grad()
-    loss = F.cross_entropy(y_hat.view(-1,y_hat.shape[-1]), y.view(-1), reduction="mean")
+    loss = F.cross_entropy(y_hat.view(-1, y_hat.shape[-1]).to(torch.float32), y.view(-1), reduction="mean")
     loss.backward()
     opt.step()
+    opt.zero_grad()
+
 
     # metrics
     with torch.no_grad():
         preds = torch.argmax(y_hat, dim=-1)
+        metrics = {
+            "loss": loss.detach(),
+            "per_position_accuracy": torch.mean(preds == y, dtype=torch.float32),
+            "exact_match": torch.mean(torch.all(preds == y, dim=-1), dtype=torch.float32)
+        }
 
-    return loss.detach(), torch.mean(preds == y, dtype=torch.float32),torch.mean(torch.all(preds == y, dim=-1), dtype=torch.float32)
+    return metrics
+
+# [Dataloader and training loop]
+def shuffle_sudoku(board: np.ndarray, solution: np.ndarray):
+    # Create a random digit mapping: a permutation of 1..9, with zero (blank) unchanged
+    digit_map = np.pad(np.random.permutation(np.arange(1, 10)), (1, 0))
+
+    # Randomly decide whether to transpose.
+    transpose_flag = np.random.rand() < 0.5
+
+    # Generate a valid row permutation:
+    # - Shuffle the 3 bands (each band = 3 rows) and for each band, shuffle its 3 rows.
+    bands = np.random.permutation(3)
+    row_perm = np.concatenate([b * 3 + np.random.permutation(3) for b in bands])
+
+    # Similarly for columns (stacks).
+    stacks = np.random.permutation(3)
+    col_perm = np.concatenate([s * 3 + np.random.permutation(3) for s in stacks])
+
+    # Build an 81->81 mapping. For each new cell at (i, j)
+    # (row index = i // 9, col index = i % 9),
+    # its value comes from old row = row_perm[i//9] and old col = col_perm[i%9].
+    mapping = np.array([row_perm[i // 9] * 9 + col_perm[i % 9] for i in range(81)])
+
+    def apply_transformation(x: np.ndarray) -> np.ndarray:
+        # Apply transpose flag
+        if transpose_flag:
+            x = x.T
+        # Apply the position mapping.
+        new_board = x.flatten()[mapping].reshape(9, 9).copy()
+        # Apply digit mapping
+        return digit_map[new_board]
+
+    return apply_transformation(board), apply_transformation(solution)
+
+def collate_fn(batch: Dict[str, Any]) -> Tuple[torch.Tensor, torch.Tensor]:
+    xs, ys = [], []
+    for item in batch:
+        board = np.frombuffer(item["question"].replace('.', '0').encode(), dtype=np.uint8).reshape(9, 9) - ord('0')
+        solution = np.frombuffer(item["answer"].encode(), dtype=np.uint8).reshape(9, 9) - ord('0')
+        # Convert and flatten
+        board = board.flatten().astype(np.int32)
+        solution = solution.flatten().astype(np.int32)
+        # Pad a BOS token
+        xs.append(board)
+        ys.append(solution)
+
+    return torch.from_numpy(np.stack(xs, axis=0)), torch.from_numpy(np.stack(ys, axis=0))
+
+def create_dataloader(split: str, batch_size: int):
+
+    data_files = {
+        'train_leave1':'data/train_leave1.csv',
+        'test_leave1': 'data/test_leave1.csv',
+        'train': 'data/train_convert.csv',
+        'test': 'data/test_convert.csv',
+    }
+    dataset = load_dataset('csv', data_files=data_files, split=split)
+
+    return DataLoader(
+        dataset,
+        batch_size=batch_size,
+        collate_fn=collate_fn,
+        shuffle=True,
+        drop_last=len(dataset) >= batch_size,
+        num_workers=0,  # Set to 0 to avoid multiprocessing issues in Jupyter
+        prefetch_factor=None,
+        persistent_workers=False  # Must be False when num_workers=0
+    )
 
 
 # In[ ]:
-import os
-def train():
-    # dist.init_process_group("nccl")
-    local_rank = int(os.environ["LOCAL_RANK"])
-    # world_size = int(os.environ["WORLD_SIZE"])
-    torch.cuda.set_device(local_rank)
-
-    model_config  = tyro.cli(HRMConfig)
-    set_up(model_config.seed)
 
 
-    model = HRM(model_config).cuda(local_rank)
+
+model_config  = tyro.cli(HRMConfig)
+set_up(model_config.seed)
+device = torch.accelerator.current_accelerator(check_available=True)
+if device is None:
+    device = torch.device("cpu")
+
+print (f"Training on {device.type}")
+
+# Initialize
+data_name = ['train','test']
+train_loader = create_dataloader(data_name[0], model_config.batch_size)
+total_steps = int(model_config.cycle_per_data * len(train_loader) * model_config.epochs)
+
+with torch.device(device):
+    model = HRM(model_config)
     model = torch.compile(model, dynamic=False, fullgraph=True)
-    # model = DDP(model, device_ids=[local_rank],static_graph=True)
-    #
 
-    # from muon import SingleDeviceMuon
-    from torch.optim import Adam
+# from muon import SingleDeviceMuon
+from torch.optim import Adam
 
-    opt = Adam(model.parameters(), lr=model_config.lr, weight_decay=model_config.weight_decay)
-    # from torch.utils.data.distributed import DistributedSampler
-    from util.data import SudokuDataset
-    dataset = SudokuDataset('data/train_convert.csv')
-    # train_sampler = DistributedSampler(dataset,shuffle=True)
-    train_loader = DataLoader(dataset, batch_size=model_config.batch_size, shuffle=True, num_workers=4, pin_memory=True)
-    # train_loader = DataLoader(dataset, batch_size=model_config.batch_size)
-
-    eval_dataset = SudokuDataset('data/test_convert.csv')
-    # eval_sampler = DistributedSampler(eval_dataset, shuffle=False)
-    eval_loader= DataLoader(eval_dataset, batch_size=model_config.batch_size, shuffle=True, num_workers=4, pin_memory=True)
+opt = Adam(model.parameters(), lr=model_config.lr, weight_decay=model_config.weight_decay)
 
 
-    # Train & Eval loop
-    ema_helper = None
-    if model_config.ema:
-        print('Setup EMA')
-        ema_helper = EMAHelper(mu=model_config.ema_rate)
-        ema_helper.register(model)
+# Train & Eval loop
+ema_helper = None
+if model_config.ema:
+    print('Setup EMA')
+    ema_helper = EMAHelper(mu=model_config.ema_rate)
+    ema_helper.register(model)
 
-    if local_rank==0:
-        wanted_dict = model_config.to_dict()
-        exp_str = "-".join(f"{k}_{v}" for k,v in wanted_dict.items())
-        log_file= open(f'{exp_str}.txt', 'w')
-        print(model_config)
-        log_file.write(str(model_config))
-        log_file.flush()
 
-    for epoch in range(1, model_config.epochs+1):
-        model.train()
-        step = 0
+eval_loaders = {split_name: create_dataloader(split_name, model_config.batch_size) for split_name in [data_name[1]]}
 
-        len_train = train_loader.__len__()
+import datetime, os
+timestamp = datetime.datetime.now().strftime('%Y%m%d%H%M%S')
+current_file_name = os.path.basename(__file__)
+wanted_dict = model_config.to_dict()
+exp_str = "-".join(f"{k}_{v}" for k,v in wanted_dict.items())
+
+log_file= open(f'{exp_str}.txt', 'w')
+print(model_config)
+log_file.write(str(model_config))
+log_file.flush()
+
+for epoch in range(1, model_config.epochs+1):
+    model.train()
+    step = 0
+    model.keep_carry()
+    for x, y in train_loader:
+        x = x.to(device)
+        y = y.long().to(device)
+        # with torch.device(device):
+        #     model.init_carry()
+
+        for cycle in range(model_config.cycle_per_data):
+            metrics = train_step(model, opt, x, y)
+            if model_config.ema:
+                ema_helper.update(model)
+            # if metrics['exact_match']>0.99:
+            #     break
+        step += 1
+        # scheduler.step()
         model.restore_carry()
-        for x, y in train_loader:
-            x = x.cuda(local_rank)
-            y = y.cuda(local_rank)
-
-            for cycle in range(model_config.cycle_per_data):
-                loss, per_pos_crt, crt = train_step(model, opt, x, y)
-                if model_config.ema:
-                    ema_helper.update(model)
-                # if metrics['exact_match']>0.99:
-                #     break
-            step += 1
-            # scheduler.step()
-            model.restore_carry()
-            if local_rank==0 and step%25==0:
-                info = f"Ep {epoch}/{model_config.epochs} Step {step}/{len_train}: loss={loss:.6f} per_position_accuracy={per_pos_crt:.6f}, exact_match={crt:.6f}"
-                print (info)
-                log_file.write(info+'\n')
-                log_file.flush()
-
-        model.eval()
-        if model_config.ema:
-            print("SWITCH TO EMA")
-            ema_helper.ema(model)
-
-        correct = torch.tensor(0, dtype=torch.long).cuda(local_rank)
-        total = torch.tensor(0, dtype=torch.long).cuda(local_rank)
-        with torch.no_grad():
-            for x, y in eval_loader:
-                for cycle in range(model_config.cycle_per_data):
-                    y_hat = model(x.cuda(local_rank))
-                y_hat = torch.argmax(y_hat, dim=-1)
-                total += y.shape[0]
-                correct += torch.all(y_hat == y.cuda(local_rank), dim=-1).sum().item()
-                model.restore_carry()
-        # dist.all_reduce(correct, op=dist.ReduceOp.SUM)
-        # dist.all_reduce(total, op=dist.ReduceOp.SUM)
-        if local_rank==0:
-            info =  f"[Eval Set test ]" + f"Solved: {100 * correct / total:.2f}% ({correct}/{total})"
-            print(info)
-            log_file.write(info + '\n')
+        if step%25==0:
+            info = f"Ep {epoch}/{model_config.epochs} Step {step}/{len(train_loader)}: " + ', '.join(f'{k}={v.item() if isinstance(v, torch.Tensor) else v:.6f}' for k, v in metrics.items())
+            print (info)
+            log_file.write(info+'\n')
             log_file.flush()
 
-if __name__=='__main__':
+    model.eval()
+    if model_config.ema:
+        print("SWITCH TO EMA")
+        ema_helper.ema(model)
 
-    train()
+    model.keep_carry()
+    for eval_name, eval_loader in eval_loaders.items():
+        num_total = 0
+        num_correct = 0
+        for x, y in eval_loader:
+            for cycle in range(model_config.cycle_per_data):
+                y_hat = model(x.to(device))
+            y_hat = torch.argmax(y_hat, dim=-1)
+            num_total += y.shape[0]
+            num_correct += torch.all(y_hat == y.to(device), dim=-1).sum().item()
+            model.restore_carry()
+        info =  f"[Eval Set {eval_name}]" + f"Solved: {100 * num_correct / num_total:.2f}% ({num_correct}/{num_total})"
+        print(info)
+        log_file.write(info + '\n')
+        log_file.flush()
+
+    # if train_config.ema:
+    #     print("SWITCH TO Normal")
+    #     ema_helper.normal(model)
+
+    # torch.save(model.state_dict(), f"model/HRM_Mini_ema_{epoch}.pth")
+    # print(f'model saved at epoch {epoch}, location: model/HRM_Mini_ema_{epoch}.pth')
 
