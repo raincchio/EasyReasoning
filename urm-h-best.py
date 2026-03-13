@@ -12,7 +12,7 @@ import torch.nn.functional as F
 import numpy as np
 from einops import rearrange
 
-from datasets import load_dataset
+from tqdm import tqdm
 from torch.utils.data import DataLoader
 import random
 import torch.nn.init as init
@@ -436,7 +436,7 @@ def train():
 
         len_train = train_loader.__len__()
         model.restore_carry()
-        for x, y in train_loader:
+        for x, y in tqdm(train_loader):
             x = x.cuda(local_rank)
             y = y.cuda(local_rank)
 
