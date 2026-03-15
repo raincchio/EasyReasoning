@@ -27,18 +27,18 @@ class HRMConfig:
     vocab_size: int = 10  # Sudoku digits 0(unfilled) .. 9
     seq_len: int = 81  # Sudoku has 9x9 = 81 cells + BOS
 
-    hidden_size: int = 22
+    hidden_size: int = 512
     # intermediate_size: int = 256
     batch_size: int = 1024
     head_dim: int = 64
     is_causal: bool = False
 
-    num_layers: int = 4
+    num_layers: int = 8
 
     H_cycles: int = 1
-    L_cycles: int = 2
+    L_cycles: int = 1
 
-    cycle_per_data: int = 4
+    cycle_per_data: int = 16
 
     norm_eps: float = 1e-4
     rope_base: float = 10000.0
@@ -52,7 +52,7 @@ class HRMConfig:
     weight_decay: float = 0
 
     ema:bool = False
-    ema_rate: float = 1 - 1e-5
+    ema_rate: float = 1 - 3e-5
 
     def to_dict(self):
         return {
@@ -60,7 +60,8 @@ class HRMConfig:
             "H_cycles": self.H_cycles, # H
             "L_cycles": self.L_cycles, # R
             "cycle_per_data": self.cycle_per_data, # Rec
-            "hidden_size":self.hidden_size # width
+            "hidden_size":self.hidden_size, # width,
+            'ema':self.ema
         }
 
 # In[19]:
@@ -169,132 +170,6 @@ class CastedScaledEmbedding(nn.Module):
     def forward(self, input: torch.Tensor) -> torch.Tensor:
         return F.embedding(input, self.scale * self.weight.to(self.cast_to))
 
-class RotaryEmbedding(nn.Module):
-    def __init__(self, dim, max_position_embeddings, base, device=None):
-        super().__init__()
-
-        # RoPE
-        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float32, device=device) / dim))
-        t = torch.arange(max_position_embeddings, dtype=torch.float32, device=device)
-        freqs = torch.outer(t, inv_freq)
-
-        # Different from paper, but it uses a different permutation in order to obtain the same calculation
-        emb = torch.cat((freqs, freqs), dim=-1)
-        self.cos_cached = nn.Buffer(emb.cos(), persistent=False)
-        self.sin_cached = nn.Buffer(emb.sin(), persistent=False)
-
-    def forward(self):
-        return self.cos_cached, self.sin_cached
-
-
-class ConvSwiGLU(nn.Module):
-    def __init__(
-        self,
-        hidden_size: int,
-        conv_kernel: int = 2,
-        intermediate_size: int = None,
-    ):
-        super().__init__()
-
-        inter = intermediate_size
-        self.inter = inter
-        self.gate_up_proj = CastedLinear(hidden_size, inter * 2, bias=False)
-        # self.dwconv = nn.Conv1d(
-        #     in_channels=inter,
-        #     out_channels=inter,
-        #     kernel_size=conv_kernel,
-        #     padding=conv_kernel // 2,
-        #     groups=inter,
-        #     bias=False,
-        # ).to(dtype=torch.bfloat16)
-
-        self.act = nn.SiLU()
-        self.down_proj = CastedLinear(inter, hidden_size, bias=False)
-
-    def forward(self, x: torch.Tensor):
-        gate, up = self.gate_up_proj(x).chunk(2, dim=-1)
-        x_conv = F.silu(gate) * up
-        # x_conv = self.dwconv(x_conv.transpose(1, 2).to(self.dwconv.weight.dtype))
-        # x_conv = x_conv[..., :up.size(1)]
-        # x_conv = self.act(x_conv)
-        # x_conv = x_conv.transpose(1, 2).contiguous()
-        x_out = self.down_proj(x_conv)
-
-        return x_out
-
-
-class Attention(nn.Module):
-    def __init__(self, hidden_size, head_dim, num_heads, is_causal, **kwargs):
-        super().__init__()
-        self.head_dim = head_dim
-        self.num_heads = num_heads
-        self.is_causal = is_causal
-
-        self.qkv_proj = CastedLinear(hidden_size, self.num_heads * self.head_dim, bias=False, batch_output_dims=(3, ), **kwargs)
-        self.o_proj = CastedLinear(head_dim * num_heads, hidden_size, bias=False, **kwargs)
-        with torch.no_grad():
-            self.o_proj.weight.zero_()
-
-    def forward(self, hidden_states: torch.Tensor, cos_sin: CosSin) -> torch.Tensor:
-        # hidden_states, qkv: [..., seq_len, hidden_size]
-        qkv = self.qkv_proj(hidden_states)
-
-        # Split head (last dimension of projected qkv)
-        qkv = rearrange(qkv, "... (h hd) -> ... h hd", h=self.num_heads)
-        query, key, value = qkv.chunk(3, dim=-1)
-        # Rotary embedding
-        query = apply_rotary_pos_emb(query, cos_sin)
-        key = apply_rotary_pos_emb(key, cos_sin)
-        # PyTorch SDPA attention
-        # query, key, value: [... x seq_len x num_heads x head_dim]
-        attn_output = F.scaled_dot_product_attention(query.transpose(-2, -3), key.transpose(-2, -3), value.transpose(-2, -3), is_causal=self.is_causal).transpose(-2, -3)
-        # attn_output: [..., seq_len, num_heads, head_dim]
-        attn_output = rearrange(attn_output, "... h hd -> ... (h hd)")
-        return self.o_proj(attn_output)
-
-class TransformerBlock(nn.Module):
-    def __init__(self, config: HRMConfig) -> None:
-        super().__init__()
-        self.attn = Attention(
-            hidden_size=config.hidden_size,
-            head_dim=config.head_dim,
-            num_heads=config.hidden_size // config.head_dim,
-            is_causal=config.is_causal
-        )
-        self.mlp = ConvSwiGLU(
-            hidden_size=config.hidden_size,
-            intermediate_size=config.intermediate_size
-        )
-        self.norm = lambda x: F.rms_norm(x, (x.shape[-1], ), eps=config.norm_eps)
-
-    def forward(self, x: torch.Tensor, **kwargs) -> torch.Tensor:  # Post Norm
-        x = self.norm(x + self.attn(x, **kwargs))
-        return self.norm(x + self.mlp(x))
-
-# class MLPBlock(nn.Module):
-#     def __init__(self, config: HRMConfig) -> None:
-#         super().__init__()
-#         # hidden_size=512
-#         # self.seq = nn.Sequential(
-#         #     nn.Linear(config.hidden_size, config.hidden_size),
-#         #     nn.ReLU(),
-#         #     nn.LayerNorm(config.hidden_size),
-#         #     # nn.Linear(config.hidden_size, config.hidden_size),
-#         #     # nn.ReLU(),
-#         #     # nn.LayerNorm(config.hidden_size),
-#         # )
-#         self.relation = RelationNetwork(d_model=config.hidden_size, hidden=config.hidden_size)
-#         # for module in self.relation:
-#         #     if isinstance(module, nn.Linear):
-#         #         # 高斯初始化，均值0，方差小一些，比如 std=0.01
-#         #         init.normal_(module.weight, mean=0.0, std=0.01)
-#         #         if module.bias is not None:
-#         #             nn.init.constant_(module.bias, 0.0)
-#
-#
-#     def forward(self, x: torch.Tensor, **kwargs) -> torch.Tensor:  # Post Norm
-#         # x = self.seq(x)
-#         return self.relation(x)
 class MLPSeqBlock(nn.Module):
     def __init__(self, config: HRMConfig, **kwargs) -> None:
         super().__init__()
@@ -383,7 +258,7 @@ class HRM(nn.Module):
             torch.empty(config.batch_size, self.seq_len, self.hidden_size, dtype=self.dtype), std=1.0))
 
         # RoPE
-        self.rope = RotaryEmbedding(config.head_dim, config.seq_len, config.rope_base)
+        # self.rope = RotaryEmbedding(config.head_dim, config.seq_len, config.rope_base)
         # I/O Layers
         self.embed = CastedScaledEmbedding(config.vocab_size, config.hidden_size, cast_to=self.dtype)
         self.lm_head = CastedLinear(config.hidden_size, config.vocab_size, bias=False)
@@ -418,17 +293,11 @@ class HRM(nn.Module):
         with torch.no_grad():
             # compatible for inference
             z_H = self.carry_h[:input_ids.shape[0]]
-            z_L = self.carry_l[:input_ids.shape[0]] # Unpack tuple
-            for _i in range(self.H_cycles - 1):
-                for _j in range(self.L_cycles):
-                    z_L = self.L_level(z_L, z_H + x, **seq_info)
-                z_H = self.H_level(z_H, z_L, **seq_info)
-
-            for _j in range(self.L_cycles-1):
-                z_L = self.L_level(z_L, z_H + x, **seq_info)
+            z_L = self.carry_l[:input_ids.shape[0]] # Unpack tuplev
 
         z_L = self.L_level(z_L, z_H + x, **seq_info)
-        z_H = self.H_level(z_H, z_L , **seq_info)
+
+
 
         self.carry_h = torch.cat((z_H, self.carry_h[input_ids.shape[0]:]), dim=0).detach()
         self.carry_l = torch.cat((z_L, self.carry_l[input_ids.shape[0]:]), dim=0).detach()
@@ -442,7 +311,7 @@ class HRM(nn.Module):
 
 
 # [Training and Inference Step]
-# @torch.compile(dynamic=False)
+@torch.compile(dynamic=False)
 def train_step(model: nn.Module, opt: torch.optim.Optimizer, x: torch.Tensor, y: torch.Tensor):
 
     y_hat = model(x)
@@ -465,74 +334,6 @@ def train_step(model: nn.Module, opt: torch.optim.Optimizer, x: torch.Tensor, y:
 
     return metrics
 
-# [Dataloader and training loop]
-def shuffle_sudoku(board: np.ndarray, solution: np.ndarray):
-    # Create a random digit mapping: a permutation of 1..9, with zero (blank) unchanged
-    digit_map = np.pad(np.random.permutation(np.arange(1, 10)), (1, 0))
-
-    # Randomly decide whether to transpose.
-    transpose_flag = np.random.rand() < 0.5
-
-    # Generate a valid row permutation:
-    # - Shuffle the 3 bands (each band = 3 rows) and for each band, shuffle its 3 rows.
-    bands = np.random.permutation(3)
-    row_perm = np.concatenate([b * 3 + np.random.permutation(3) for b in bands])
-
-    # Similarly for columns (stacks).
-    stacks = np.random.permutation(3)
-    col_perm = np.concatenate([s * 3 + np.random.permutation(3) for s in stacks])
-
-    # Build an 81->81 mapping. For each new cell at (i, j)
-    # (row index = i // 9, col index = i % 9),
-    # its value comes from old row = row_perm[i//9] and old col = col_perm[i%9].
-    mapping = np.array([row_perm[i // 9] * 9 + col_perm[i % 9] for i in range(81)])
-
-    def apply_transformation(x: np.ndarray) -> np.ndarray:
-        # Apply transpose flag
-        if transpose_flag:
-            x = x.T
-        # Apply the position mapping.
-        new_board = x.flatten()[mapping].reshape(9, 9).copy()
-        # Apply digit mapping
-        return digit_map[new_board]
-
-    return apply_transformation(board), apply_transformation(solution)
-
-def collate_fn(batch: Dict[str, Any]) -> Tuple[torch.Tensor, torch.Tensor]:
-    xs, ys = [], []
-    for item in batch:
-        board = np.frombuffer(item["question"].replace('.', '0').encode(), dtype=np.uint8).reshape(9, 9) - ord('0')
-        solution = np.frombuffer(item["answer"].encode(), dtype=np.uint8).reshape(9, 9) - ord('0')
-        # Convert and flatten
-        board = board.flatten().astype(np.int32)
-        solution = solution.flatten().astype(np.int32)
-        # Pad a BOS token
-        xs.append(board)
-        ys.append(solution)
-
-    return torch.from_numpy(np.stack(xs, axis=0)), torch.from_numpy(np.stack(ys, axis=0))
-
-def create_dataloader(split: str, batch_size: int):
-
-    data_files = {
-        'train_leave1':'data/train_leave1.csv',
-        'test_leave1': 'data/test_leave1.csv',
-        'train': 'data/train_convert.csv',
-        'test': 'data/test_convert.csv',
-    }
-    dataset = load_dataset('csv', data_files=data_files, split=split)
-
-    return DataLoader(
-        dataset,
-        batch_size=batch_size,
-        collate_fn=collate_fn,
-        shuffle=True,
-        drop_last=len(dataset) >= batch_size,
-        num_workers=0,  # Set to 0 to avoid multiprocessing issues in Jupyter
-        prefetch_factor=None,
-        persistent_workers=False  # Must be False when num_workers=0
-    )
-
 
 # In[ ]:
 
@@ -548,7 +349,19 @@ print (f"Training on {device.type}")
 
 # Initialize
 data_name = ['train','test']
-train_loader = create_dataloader(data_name[0], model_config.batch_size)
+
+from util.data import SudokuDataset
+
+dataset = SudokuDataset('data/train_convert.csv')
+
+train_loader = DataLoader(dataset, batch_size=model_config.batch_size, shuffle=True, num_workers=4,
+                          pin_memory=True)
+
+eval_dataset = SudokuDataset('data/test_convert.csv')
+
+eval_loader = DataLoader(eval_dataset, batch_size=model_config.batch_size, shuffle=True, num_workers=4,
+                         pin_memory=True)
+
 total_steps = int(model_config.cycle_per_data * len(train_loader) * model_config.epochs)
 
 with torch.device(device):
@@ -569,8 +382,6 @@ if model_config.ema:
     ema_helper.register(model)
 
 
-eval_loaders = {split_name: create_dataloader(split_name, model_config.batch_size) for split_name in [data_name[1]]}
-
 import datetime, os
 timestamp = datetime.datetime.now().strftime('%Y%m%d%H%M%S')
 current_file_name = os.path.basename(__file__)
@@ -589,17 +400,14 @@ for epoch in range(1, model_config.epochs+1):
     for x, y in train_loader:
         x = x.to(device)
         y = y.long().to(device)
-        # with torch.device(device):
-        #     model.init_carry()
 
         for cycle in range(model_config.cycle_per_data):
             metrics = train_step(model, opt, x, y)
             if model_config.ema:
                 ema_helper.update(model)
-            # if metrics['exact_match']>0.99:
-            #     break
+
         step += 1
-        # scheduler.step()
+
         model.restore_carry()
         if step%25==0:
             info = f"Ep {epoch}/{model_config.epochs} Step {step}/{len(train_loader)}: " + ', '.join(f'{k}={v.item() if isinstance(v, torch.Tensor) else v:.6f}' for k, v in metrics.items())
@@ -612,26 +420,17 @@ for epoch in range(1, model_config.epochs+1):
         print("SWITCH TO EMA")
         ema_helper.ema(model)
 
-    model.keep_carry()
-    for eval_name, eval_loader in eval_loaders.items():
-        num_total = 0
-        num_correct = 0
-        for x, y in eval_loader:
-            for cycle in range(model_config.cycle_per_data):
-                y_hat = model(x.to(device))
-            y_hat = torch.argmax(y_hat, dim=-1)
-            num_total += y.shape[0]
-            num_correct += torch.all(y_hat == y.to(device), dim=-1).sum().item()
-            model.restore_carry()
-        info =  f"[Eval Set {eval_name}]" + f"Solved: {100 * num_correct / num_total:.2f}% ({num_correct}/{num_total})"
-        print(info)
-        log_file.write(info + '\n')
-        log_file.flush()
-
-    # if train_config.ema:
-    #     print("SWITCH TO Normal")
-    #     ema_helper.normal(model)
-
-    # torch.save(model.state_dict(), f"model/HRM_Mini_ema_{epoch}.pth")
-    # print(f'model saved at epoch {epoch}, location: model/HRM_Mini_ema_{epoch}.pth')
+    num_total = 0
+    num_correct = 0
+    for x, y in eval_loader:
+        for cycle in range(model_config.cycle_per_data):
+            y_hat = model(x.to(device))
+        y_hat = torch.argmax(y_hat, dim=-1)
+        num_total += y.shape[0]
+        num_correct += torch.all(y_hat == y.to(device), dim=-1).sum().item()
+        model.restore_carry()
+    info =  f"[Eval Set test ]" + f"Solved: {100 * num_correct / num_total:.2f}% ({num_correct}/{num_total})"
+    print(info)
+    log_file.write(info + '\n')
+    log_file.flush()
 

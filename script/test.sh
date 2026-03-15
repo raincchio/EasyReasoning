@@ -2,17 +2,17 @@ cd /vepfs-dev/xing/workspace/EasyReasoning/
 export PYTHONPATH=$(pwd):$(pwd)
 python=/vepfs-dev/xing/miniconda3/envs/test/bin/python
 
-declare -i i=7
-available_gpus=(0 1 2 3 4 5 6 7)
-cycle=4
-for h in 1
+declare -i i=3
+available_gpus=(0 1 2 3)
+cycle=16
+for h in 3
 do
-    for l in 2
+    for l in 1
     do
     #      echo ${wd}
       export CUDA_VISIBLE_DEVICES=${available_gpus[$((i % ${#available_gpus[@]}))]}
       i+=1
-      cmd="nohup ${python} -um urm-h-best --num_layers 4 --hidden_size 512 --H_cycles ${h} --L_cycles ${l}  --cycle_per_data ${cycle} >>/dev/null 2>&1 &"
+      cmd="nohup ${python} -um urm-mlp-best --num_layers 4 --hidden_size 512 --H_cycles ${h} --L_cycles ${l}  --cycle_per_data ${cycle} >>/dev/null 2>&1 &"
       eval $cmd
     done
 done
